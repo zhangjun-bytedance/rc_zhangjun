@@ -1,0 +1,24 @@
+# 编译产物
+# 注意必须带前导 /，否则会连 cmd/notifyd/ 这类源码目录一起忽略掉。
+/bin/
+/notifyd
+/mockvendor
+
+# 运行时数据（SQLite 队列库及其 WAL/shm 副文件）
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# 测试与覆盖率
+coverage.out
+coverage.html
+*.test
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store

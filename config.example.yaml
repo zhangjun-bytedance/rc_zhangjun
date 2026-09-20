@@ -1,0 +1,105 @@
+# 生产形态配置示例。
+#
+# 和 config.yaml（demo 用）的关键区别：
+#   1. 所有凭据都用 ${env:VAR} 从环境变量注入，不写进仓库；
+#      引用了未设置的变量会让进程启动失败，而不是带着空 token 上线。
+#   2. 按供应商的真实脾气分别配超时/退避/并发，而不是一套参数打天下。
+#   3. admin 接口强制鉴权。
+#
+# 上线前建议先跑一次：./notifyd -config config.yaml -validate
+
+server:
+  addr: ":8080"
+  max_body_bytes: 262144 # 256 KiB，通知体通常只有几百字节
+  read_timeout: 10s
+  write_timeout: 10s
+  shutdown_grace: 30s
+  admin_token: "${env:NOTIFYD_ADMIN_TOKEN}"
+
+store:
+  path: "/var/lib/notifyd/notify.db"
+  synchronous: FULL
+  busy_timeout: 5s
+
+dispatcher:
+  instance_id: "" # 交给 hostname-pid，滚动发布时新旧进程能被区分开
+  poll_interval: 500ms
+  batch_size: 50
+  lease_duration: 120s
+  reaper_interval: 30s
+
+defaults:
+  method: POST
+  content_type: application/json
+  timeout: 5s
+  max_attempts: 10
+  concurrency: 8
+  backoff:
+    base: 2s
+    max: 30m # 覆盖到"下游故障半小时"的量级，重试预算不会在几分钟内被烧完
+    jitter: 0.3
+  breaker:
+    enabled: true
+    failure_threshold: 5
+    cooldown: 60s
+    half_open_probes: 1
+  retry_status_codes: [408, 423, 425, 429]
+
+endpoints:
+  # 广告系统：注册回传。SLA 好但要求 QPS 不高，用并发上限压住。
+  - name: adnetwork
+    url: "https://api.ad-partner.example.com/v1/conversions"
+    headers:
+      X-Client-Id: "${env:ADNETWORK_CLIENT_ID}"
+      X-Client-Secret: "${env:ADNETWORK_CLIENT_SECRET}"
+    timeout: 3s
+    concurrency: 4
+    max_attempts: 8
+
+  # CRM：付款成功改 Contact 状态。对方是 SaaS，偶发 502 且有全局限流，
+  # 所以退避给得更耐心，并允许透传业务侧的追踪 header。
+  - name: crm
+    url: "https://crm.example.com/api/v2/contacts/status"
+    headers:
+      Authorization: "Bearer ${env:CRM_API_TOKEN}"
+    timeout: 10s
+    concurrency: 6
+    max_attempts: 12
+    backoff:
+      base: 5s
+      max: 1h
+      jitter: 0.4
+    allow_caller_headers:
+      - X-Request-Id
+      - X-Tenant-Id
+
+  # 库存系统：内部服务，延迟低、可用性高，所以并发开大、退避收紧。
+  # 对方只接受扁平结构，用 body_template 补一层壳。
+  - name: inventory
+    url: "http://inventory.internal.svc:8080/inventory/adjust"
+    timeout: 2s
+    concurrency: 32
+    max_attempts: 6
+    backoff:
+      base: 500ms
+      max: 2m
+      jitter: 0.3
+    body_template: |-
+      {"sku":"{{ .sku }}","delta":{{ .quantity }},"ref":"{{ .order_id }}"}
+
+  # 某老旧供应商：成功时返回 201，且把业务错误塞在 409 里。
+  # 显式声明成功码，并且不把 409 列进可重试——它表示"已经处理过了"，
+  # 重试只会一直撞同一个 409 直到进死信，不如立刻可见。
+  - name: legacy_erp
+    url: "https://erp.vendor.example.com/notify"
+    headers:
+      X-Api-Key: "${env:ERP_API_KEY}"
+    timeout: 15s
+    concurrency: 2
+    max_attempts: 6
+    success_status_codes: [200, 201, 202]
+    breaker:
+      enabled: true
+      failure_threshold: 3 # 这家挂得频繁，早点熔断少浪费连接
+      cooldown: 120s
+      half_open_probes: 1

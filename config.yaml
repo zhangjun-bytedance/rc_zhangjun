@@ -1,0 +1,99 @@
+# notifyd 默认配置 —— 开箱即可配合 scripts/demo.sh 跑通。
+#
+# 这份配置里的 endpoint 指向 cmd/mockvendor 启动的本地模拟供应商，
+# 所以 clone 下来不需要任何外部依赖就能完整验证投递、重试、熔断、死信全流程。
+# 生产形态的配置示例见 config.example.yaml。
+
+server:
+  addr: ":8080"
+  # 单条通知的大小上限。通知系统不是文件通道，不设上限会让一条超大 payload
+  # 同时拖垮队列表和下游请求。
+  max_body_bytes: 1048576 # 1 MiB
+  read_timeout: 10s
+  write_timeout: 10s
+  # 收到 SIGTERM 后等待在途投递完成的时长。
+  shutdown_grace: 20s
+  # 管理接口（查询/重投/取消）的 token。留空表示不鉴权，仅限本地开发。
+  # 生产环境请写成 ${env:NOTIFYD_ADMIN_TOKEN}。
+  admin_token: ""
+
+store:
+  path: "data/notify.db"
+  # FULL 保证断电也不丢已提交事务。入口既然已经对业务方承诺了 202，
+  # 就不该在这里省 fsync。需要更高写吞吐时可以降成 NORMAL。
+  synchronous: FULL
+  busy_timeout: 5s
+
+dispatcher:
+  # 留空则自动取 hostname-pid，用于标记 lease 持有者。
+  instance_id: ""
+  # 空闲时的轮询间隔。新任务入队会立刻唤醒调度器，所以这个值
+  # 只决定"重试到期"的时间精度，不影响首次投递延迟。
+  poll_interval: 250ms
+  # 单个 endpoint 单次领取的任务数上限。
+  batch_size: 20
+  # 必须显著大于所有 endpoint 的 timeout（启动时会强制校验）。
+  # lease 比请求还短会导致"请求还在飞、任务已被回收重投"的重复投递风暴。
+  lease_duration: 60s
+  reaper_interval: 15s
+
+# 所有 endpoint 的默认策略，endpoint 上显式写的字段会覆盖它。
+defaults:
+  method: POST
+  content_type: application/json
+  timeout: 5s
+  max_attempts: 8
+  # 单 endpoint 并发投递上限。这是本系统唯一的过载保护手段，
+  # 也是故障隔离的边界：一个供应商卡死最多占满它自己的这几个槽位。
+  concurrency: 8
+  backoff:
+    base: 1s
+    max: 5m
+    # 抖动不是可选项：没有它，一次下游全站故障会让所有通知
+    # 在同一毫秒集体重试，把刚恢复的下游再打挂一次。
+    jitter: 0.3
+  breaker:
+    enabled: true
+    # 连续 5 次"下游不可用"后打开熔断。
+    failure_threshold: 5
+    # 熔断期间任务留在队列里不被领取，因此不消耗重试预算。
+    cooldown: 15s
+    half_open_probes: 1
+  # 判定为可重试的状态码。未列出的非 2xx 一律视为永久失败直接进死信
+  # （所有 5xx 由代码兜底判为可重试，不需要在这里列）。
+  retry_status_codes: [408, 423, 425, 429]
+
+endpoints:
+  # 广告系统：用户注册回传。对方要求自定义 header 认证。
+  - name: adnetwork
+    url: "http://127.0.0.1:9101/track/registration"
+    headers:
+      X-Vendor-Token: "demo-ad-token"
+    timeout: 3s
+    max_attempts: 6
+    concurrency: 4
+
+  # CRM：订阅付款成功后改 Contact 状态。对方慢且偶发抖动，所以给更长的超时
+  # 和更耐心的退避曲线——供应商的脾气应该体现在配置里，而不是代码里。
+  - name: crm
+    url: "http://127.0.0.1:9102/api/v2/contacts/status"
+    headers:
+      Authorization: "Bearer demo-crm-token"
+    timeout: 8s
+    max_attempts: 10
+    concurrency: 6
+    backoff:
+      base: 2s
+      max: 10m
+      jitter: 0.3
+
+  # 库存系统：内部服务，用 body_template 把统一的 payload 转成对方要的扁平格式。
+  # 这个字段是"只差一层壳"场景的逃生舱，不是通用转换引擎（理由见 README）。
+  - name: inventory
+    url: "http://127.0.0.1:9103/inventory/adjust"
+    method: POST
+    timeout: 4s
+    max_attempts: 5
+    concurrency: 8
+    body_template: |-
+      {"sku":"{{ .sku }}","delta":{{ .quantity }},"ref":"{{ .order_id }}"}
